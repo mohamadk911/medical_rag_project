@@ -7,3 +7,10 @@ data/raw/
 data/processed/
 output/
 indexes/
+models/
+*.faiss
+*.pkl
+*.sqlite
+*.db
+*.log
+.ipynb_checkpoints/

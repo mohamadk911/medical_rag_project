@@ -1,3 +1,24 @@
+"""
+llm_rerank.py
+
+This file performs LLM-based reranking of retrieved regulatory chunks.
+
+Purpose:
+1. Take candidate chunks from retrieval.
+2. Ask the LLM to select the most relevant chunks for the user question.
+3. Support both MDR and MDCG chunk IDs:
+   - mdr_chunk_0001
+   - mdcg_chunk_0001
+4. Keep the reranker separate from retrieval:
+   - retrieve.py finds possible evidence
+   - llm_rerank.py selects the best evidence
+5. If the LLM gives an invalid format, the function safely falls back to the
+   original top chunks instead of failing.
+
+This file does not answer the user question.
+It only returns a better ordered list of chunks.
+"""
+
 from pathlib import Path
 from typing import List, Dict
 import os
@@ -33,6 +54,9 @@ def format_chunks_for_rerank(chunks: List[Dict]) -> str:
             f"""
 CANDIDATE {i}
 CHUNK ID: {chunk.get("chunk_id")}
+SOURCE TYPE: {chunk.get("source_type")}
+DOCUMENT: {chunk.get("document_title")}
+REFERENCE: {chunk.get("reference")}
 TITLE: {chunk.get("title")}
 TYPE: {chunk.get("type")}
 PAGES: {chunk.get("page_start")} - {chunk.get("page_end")}
@@ -47,7 +71,11 @@ TEXT:
 
 
 def extract_chunk_ids(text: str) -> list[str]:
-    return re.findall(r"mdr_chunk_\d{4}", text)
+    return re.findall(
+        r"(?:mdr_chunk|mdcg_chunk)_\d{4}",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def llm_rerank_chunks(
@@ -75,7 +103,7 @@ def llm_rerank_chunks(
 USER QUESTION:
 {question}
 
-RETRIEVED MDR CHUNK CANDIDATES:
+RETRIEVED REGULATORY CHUNK CANDIDATES:
 {candidate_text}
 """
 
@@ -86,20 +114,25 @@ RETRIEVED MDR CHUNK CANDIDATES:
 
     selected_ids = extract_chunk_ids(response.text or "")
 
-    chunk_map = {chunk["chunk_id"]: chunk for chunk in retrieved_chunks}
+    chunk_map = {
+        chunk["chunk_id"].lower(): chunk
+        for chunk in retrieved_chunks
+        if chunk.get("chunk_id")
+    }
 
     reranked_chunks = []
     used_ids = set()
 
     for chunk_id in selected_ids:
-        if chunk_id in chunk_map and chunk_id not in used_ids:
-            reranked_chunks.append(chunk_map[chunk_id])
-            used_ids.add(chunk_id)
+        normalized_id = chunk_id.lower()
+
+        if normalized_id in chunk_map and normalized_id not in used_ids:
+            reranked_chunks.append(chunk_map[normalized_id])
+            used_ids.add(normalized_id)
 
         if len(reranked_chunks) >= top_k:
             break
 
-    # Fallback: if Gemini returns bad format, keep original top chunks.
     if not reranked_chunks:
         return retrieved_chunks[:top_k]
 
