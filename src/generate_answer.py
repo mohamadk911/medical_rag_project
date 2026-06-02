@@ -26,6 +26,7 @@ import os
 
 from dotenv import load_dotenv
 from google import genai
+from llm_utils import generate_content_with_retries
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -113,7 +114,8 @@ USER QUESTION:
 {question}
 """
 
-    response = client.models.generate_content(
+    response = generate_content_with_retries(
+        client=client,
         model=GEMINI_MODEL,
         contents=full_prompt,
     )

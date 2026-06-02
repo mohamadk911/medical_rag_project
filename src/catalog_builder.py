@@ -22,8 +22,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 MDR_PATH = ROOT_DIR / "data" / "raw" / "MDR.pdf"
 MDCG_DIR = ROOT_DIR / "data" / "raw" / "mdcg"
 MDCG_CATALOG_ENTRIES_PATH = MDCG_DIR / "mdcg_catalog_entries.json"
+MDCG_MANIFEST_PATH = MDCG_DIR / "mdcg_manifest.json"
 
 OUTPUT_PATH = ROOT_DIR / "data" / "processed" / "catalog.json"
+
+MDR_PREVIEW_PAGES = 4
+MDCG_PREVIEW_PAGES = 5
+MAX_PREVIEW_CHARS = 20_000
 
 
 def clean_text(text: str) -> str:
@@ -38,7 +43,11 @@ def make_document_id(filename: str) -> str:
     return name
 
 
-def get_pdf_preview(pdf_path: Path, max_pages: int = 2) -> tuple[str, int]:
+def get_pdf_preview(
+    pdf_path: Path,
+    max_pages: int = 2,
+    max_chars: int = MAX_PREVIEW_CHARS,
+) -> tuple[str, int]:
     if not pdf_path.exists():
         return "", 0
 
@@ -52,7 +61,8 @@ def get_pdf_preview(pdf_path: Path, max_pages: int = 2) -> tuple[str, int]:
                 text = doc[page_index].get_text("text")
                 texts.append(text)
 
-        return clean_text(" ".join(texts)), page_count
+        preview = clean_text(" ".join(texts))
+        return preview[:max_chars], page_count
 
     except Exception as error:
         print(f"Skipping unreadable PDF preview: {pdf_path.name} | {error}")
@@ -69,8 +79,22 @@ def load_mdcg_entries() -> List[Dict]:
         return json.load(f)
 
 
+def load_manifest_by_url() -> Dict[str, Dict]:
+    if not MDCG_MANIFEST_PATH.exists():
+        return {}
+
+    with MDCG_MANIFEST_PATH.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    return {
+        item["url"]: item
+        for item in manifest
+        if item.get("url")
+    }
+
+
 def build_mdr_catalog_entry() -> Dict:
-    preview, page_count = get_pdf_preview(MDR_PATH, max_pages=2)
+    preview, page_count = get_pdf_preview(MDR_PATH, max_pages=MDR_PREVIEW_PAGES)
     
     return {
         "document_id": "mdr_2017_745",
@@ -93,6 +117,7 @@ def build_mdr_catalog_entry() -> Dict:
 
 def build_mdcg_catalog_entries() -> List[Dict]:
     raw_entries = load_mdcg_entries()
+    manifest_by_url = load_manifest_by_url()
     catalog_entries = []
 
     seen_document_ids = set()
@@ -115,17 +140,22 @@ def build_mdcg_catalog_entries() -> List[Dict]:
 
         seen_document_ids.add(document_id)
 
-        preview, page_count = get_pdf_preview(pdf_path, max_pages=2)
+        preview, page_count = get_pdf_preview(pdf_path, max_pages=MDCG_PREVIEW_PAGES)
         if page_count == 0:
             continue
 
+        manifest_item = manifest_by_url.get(entry.get("url"), {})
         title = entry.get("title") or pdf_path.stem
         reference = entry.get("reference") or title
         category = entry.get("category") or "MDCG guidance"
 
         search_text = clean_text(
             f"{category} {reference} {title} "
+            f"{entry.get('search_text') or ''} "
+            f"{entry.get('local_filename') or ''} "
             f"{entry.get('filename_from_url') or ''} "
+            f"{manifest_item.get('title') or ''} "
+            f"{manifest_item.get('filename') or ''} "
             f"{preview}"
         )
 

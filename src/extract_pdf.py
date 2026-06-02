@@ -1,3 +1,12 @@
+"""
+Legacy MDR-only page extraction helper.
+
+The active MDR + MDCG RAG pipeline does not read data/processed/mdr_pages.json.
+Use chunk_documents.py, catalog_builder.py, build_index.py, and retrieve.py for
+the current catalog-first indexed flow. This script is kept only for local MDR
+PDF inspection and diagnostics.
+"""
+
 from pathlib import Path
 import json
 import time

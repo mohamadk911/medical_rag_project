@@ -18,8 +18,13 @@ Pipeline:
 The system never loops forever because MAX_RETRIEVAL_ATTEMPTS limits retries.
 """
 
+import os
+
+from dotenv import load_dotenv
+
 from retrieve import retrieve
 from evidence_gate import check_evidence_gate
+from fallback_answer import generate_source_fallback_answer
 from generate_answer import generate_answer
 from grounding_check import check_grounding, grounding_is_supported
 from guardrails import (
@@ -28,9 +33,24 @@ from guardrails import (
     validate_answer_text,
 )
 from llm_rerank import llm_rerank_chunks
+from llm_utils import is_quota_error
 
 
-USE_LLM_RERANKER = True
+load_dotenv()
+
+
+def env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+USE_LLM_RERANKER = env_flag("USE_LLM_RERANKER", False)
+USE_LLM_EVIDENCE_GATE = env_flag("USE_LLM_EVIDENCE_GATE", False)
+USE_LLM_GROUNDING_CHECK = env_flag("USE_LLM_GROUNDING_CHECK", False)
 
 FINAL_MDR_CONTEXT_K = 5
 FINAL_MDCG_CONTEXT_K = 6
@@ -63,8 +83,15 @@ def main() -> None:
                 mdr_chunks = retrieval_result.get("mdr_chunks", [])
                 mdcg_chunks = retrieval_result.get("mdcg_chunks", [])
 
-                validate_retrieved_chunks(mdr_chunks)
-                validate_retrieved_chunks(mdcg_chunks)
+                validate_retrieved_chunks(
+                    mdr_chunks,
+                    expected_source_type="MDR",
+                )
+                validate_retrieved_chunks(
+                    mdcg_chunks,
+                    expected_source_type="MDCG",
+                    allow_empty=True,
+                )
 
                 if USE_LLM_RERANKER:
                     print("\nReranking MDCG chunks...")
@@ -83,54 +110,84 @@ def main() -> None:
 
                 combined_chunks = mdcg_chunks + mdr_chunks
 
-                print("\nChecking source answerability...")
-                gate_result = check_evidence_gate(
-                    question,
-                    combined_chunks,
-                )
+                if USE_LLM_EVIDENCE_GATE:
+                    print("\nChecking source answerability...")
+                    try:
+                        gate_result = check_evidence_gate(
+                            question,
+                            combined_chunks,
+                        )
+                    except Exception as error:
+                        if not is_quota_error(error):
+                            raise
 
-                if not gate_result["passed"]:
-                    print("\nEvidence insufficient for this document set.")
+                        print("\nEvidence gate skipped because Gemini quota is exhausted.")
+                        gate_result = {
+                            "passed": True,
+                            "reason": "quota_skip",
+                            "message": "Skipped due to Gemini quota.",
+                        }
 
-                    if attempt < MAX_RETRIEVAL_ATTEMPTS:
-                        print("Trying next catalog document candidates...")
-                        continue
+                    if not gate_result["passed"]:
+                        print("\nEvidence insufficient for this document set.")
 
-                    print("\n" + gate_result["message"])
-                    break
+                        if attempt < MAX_RETRIEVAL_ATTEMPTS:
+                            print("Trying next catalog document candidates...")
+                            continue
+
+                        print("\n" + gate_result["message"])
+                        break
 
                 print("\nGenerating answer...")
-                answer = generate_answer(
-                    question,
-                    combined_chunks,
-                )
+                try:
+                    answer = generate_answer(
+                        question,
+                        combined_chunks,
+                    )
+                except Exception as error:
+                    if not is_quota_error(error):
+                        raise
+
+                    print("\nGemini quota exhausted. Showing retrieved source fallback.\n")
+                    print(generate_source_fallback_answer(question, combined_chunks))
+                    answer_found = True
+                    break
 
                 if not validate_answer_text(answer):
                     print("\nAnswer blocked because it contains unsupported wording.")
                     break
 
-                print("\nChecking grounding...")
-                grounding_result = check_grounding(
-                    question,
-                    answer,
-                    combined_chunks,
-                )
+                if USE_LLM_GROUNDING_CHECK:
+                    print("\nChecking grounding...")
+                    try:
+                        grounding_result = check_grounding(
+                            question,
+                            answer,
+                            combined_chunks,
+                        )
+                    except Exception as error:
+                        if not is_quota_error(error):
+                            raise
 
-                if grounding_is_supported(grounding_result):
-                    print("\nFinal answer:\n")
-                    print(answer)
-                    answer_found = True
-                    break
+                        print("\nGrounding check skipped because Gemini quota is exhausted.")
+                        grounding_result = "SUPPORTED_QUOTA_SKIPPED"
 
-                print("\nGrounding failed for this document set.")
+                    if not grounding_is_supported(grounding_result):
+                        print("\nGrounding failed for this document set.")
 
-                if attempt < MAX_RETRIEVAL_ATTEMPTS:
-                    print("Trying next catalog document candidates...")
-                    continue
+                        if attempt < MAX_RETRIEVAL_ATTEMPTS:
+                            print("Trying next catalog document candidates...")
+                            continue
 
-                print("\nAnswer blocked by grounding checker.")
-                print("\nGrounding result:\n")
-                print(grounding_result)
+                        print("\nAnswer blocked by grounding checker.")
+                        print("\nGrounding result:\n")
+                        print(grounding_result)
+                        break
+
+                print("\nFinal answer:\n")
+                print(answer)
+                answer_found = True
+                break
 
             if not answer_found:
                 pass

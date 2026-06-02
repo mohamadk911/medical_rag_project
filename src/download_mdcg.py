@@ -45,7 +45,7 @@ def is_probable_pdf_url(url: str) -> bool:
 
 
 def get_html(url: str) -> str:
-    response = requests.get(url, timeout=REQUEST_TIMEOUT)
+    response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.text
 
@@ -102,24 +102,43 @@ def guess_filename(url: str, title: str, index: int) -> str:
 
 
 def download_file(url: str, output_path: Path) -> dict:
-    with requests.get(url, stream=True, timeout=REQUEST_TIMEOUT) as response:
-        response.raise_for_status()
+    last_error = None
 
-        content_type = response.headers.get("content-type", "")
-        total_bytes = int(response.headers.get("content-length", 0))
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with requests.get(
+                url,
+                headers=HEADERS,
+                stream=True,
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                response.raise_for_status()
 
-        with output_path.open("wb") as f:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+                content_type = response.headers.get("content-type", "")
+                total_bytes = int(response.headers.get("content-length", 0))
 
-    size_bytes = output_path.stat().st_size
+                with output_path.open("wb") as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
 
-    return {
-        "content_type": content_type,
-        "expected_bytes": total_bytes,
-        "downloaded_bytes": size_bytes,
-    }
+            size_bytes = output_path.stat().st_size
+
+            return {
+                "content_type": content_type,
+                "expected_bytes": total_bytes,
+                "downloaded_bytes": size_bytes,
+            }
+
+        except requests.RequestException as error:
+            last_error = error
+
+            if attempt == MAX_RETRIES:
+                raise
+
+            time.sleep(min(SLEEP_SECONDS, attempt * 2))
+
+    raise RuntimeError(f"Failed to download {url}: {last_error}")
 
 
 def validate_pdf(path: Path) -> bool:

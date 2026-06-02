@@ -26,6 +26,7 @@ import re
 
 from dotenv import load_dotenv
 from google import genai
+from llm_utils import generate_content_with_retries
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -107,10 +108,15 @@ RETRIEVED REGULATORY CHUNK CANDIDATES:
 {candidate_text}
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=full_prompt,
-    )
+    try:
+        response = generate_content_with_retries(
+            client=client,
+            model=GEMINI_MODEL,
+            contents=full_prompt,
+        )
+    except Exception as error:
+        print(f"LLM reranker unavailable, using retrieval order: {error}")
+        return retrieved_chunks[:top_k]
 
     selected_ids = extract_chunk_ids(response.text or "")
 

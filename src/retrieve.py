@@ -26,6 +26,7 @@ This file does not generate answers. It only retrieves evidence.
 from pathlib import Path
 import json
 import pickle
+import re
 from typing import List, Dict, Tuple
 
 import faiss
@@ -46,14 +47,17 @@ CHUNK_METADATA_PATH = INDEX_DIR / "chunk_metadata.json"
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
-BM25_TOP_K = 80
-DENSE_TOP_K = 80
+BM25_TOP_K = 120
+DENSE_TOP_K = 120
 
 MDR_FINAL_TOP_K = 6
-MDCG_FINAL_TOP_K = 8
+MDCG_FINAL_TOP_K = 12
+CATALOG_MDCG_FINAL_TOP_K = 8
 
-MDCG_DOCS_PER_ATTEMPT = 5
-CATALOG_TOP_K = 40
+MDCG_DOCS_PER_ATTEMPT = 20
+CATALOG_TOP_K = 200
+DIRECT_MDCG_POOL_TOP_K = 36
+DIRECT_MDCG_CHUNKS_PER_ATTEMPT = 12
 
 BM25_WEIGHT = 0.6
 DENSE_WEIGHT = 0.4
@@ -128,6 +132,7 @@ def select_documents(query: str, attempt: int = 1) -> Dict[str, List[Dict]]:
         doc for doc in catalog_results
         if doc.get("source_type") == "MDCG"
     ]
+    mdcg_docs_all = boost_explicit_mdcg_references(query, mdcg_docs_all)
 
     start = (attempt - 1) * MDCG_DOCS_PER_ATTEMPT
     end = start + MDCG_DOCS_PER_ATTEMPT
@@ -135,7 +140,47 @@ def select_documents(query: str, attempt: int = 1) -> Dict[str, List[Dict]]:
     return {
         "mdr_docs": mdr_docs[:1],
         "mdcg_docs": mdcg_docs_all[start:end],
+        "catalog_results": catalog_results,
     }
+
+
+def extract_mdcg_references(query: str) -> set[str]:
+    matches = re.findall(
+        r"\bMDCG\s*(\d{4})\s*[-_]\s*(\d+)\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+
+    return {
+        f"mdcg_{year}_{number}"
+        for year, number in matches
+    }
+
+
+def boost_explicit_mdcg_references(query: str, docs: List[Dict]) -> List[Dict]:
+    reference_keys = extract_mdcg_references(query)
+
+    if not reference_keys:
+        return docs
+
+    boosted = []
+    remaining = []
+
+    for doc in docs:
+        searchable = " ".join([
+            str(doc.get("document_id", "")),
+            str(doc.get("reference", "")),
+            str(doc.get("title", "")),
+            str(doc.get("local_path", "")),
+            str(doc.get("search_text", "")),
+        ]).lower().replace("-", "_")
+
+        if any(reference_key in searchable for reference_key in reference_keys):
+            boosted.append(doc)
+        else:
+            remaining.append(doc)
+
+    return boosted + remaining
 
 
 def chunk_allowed(
@@ -309,6 +354,46 @@ def retrieve_track(
     )
 
 
+def get_document_ids_by_source(chunks: List[Dict], source_type: str) -> set[str]:
+    return {
+        chunk["document_id"]
+        for chunk in chunks
+        if (
+            chunk.get("source_type") == source_type
+            and chunk.get("document_id")
+        )
+    }
+
+
+def deduplicate_chunks(chunks: List[Dict], limit: int) -> List[Dict]:
+    results = []
+    seen_chunk_ids = set()
+
+    for chunk in chunks:
+        chunk_id = chunk.get("chunk_id")
+
+        if not chunk_id or chunk_id in seen_chunk_ids:
+            continue
+
+        results.append(chunk)
+        seen_chunk_ids.add(chunk_id)
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def slice_attempt_results(
+    results: List[Dict],
+    attempt: int,
+    per_attempt: int,
+) -> List[Dict]:
+    start = (attempt - 1) * per_attempt
+    end = start + per_attempt
+    return results[start:end]
+
+
 def retrieve(query: str, attempt: int = 1) -> Dict:
     selected = select_documents(query, attempt=attempt)
 
@@ -325,6 +410,7 @@ def retrieve(query: str, attempt: int = 1) -> Dict:
     }
 
     faiss_index, bm25_index, chunks = load_chunk_indexes()
+    all_mdcg_doc_ids = get_document_ids_by_source(chunks, "MDCG")
 
     print("Loading FastEmbed model for chunk retrieval...")
     model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
@@ -340,7 +426,7 @@ def retrieve(query: str, attempt: int = 1) -> Dict:
         final_top_k=MDR_FINAL_TOP_K,
     )
 
-    mdcg_chunks = retrieve_track(
+    catalog_mdcg_chunks = retrieve_track(
         query=query,
         source_type="MDCG",
         document_ids=mdcg_doc_ids,
@@ -348,13 +434,35 @@ def retrieve(query: str, attempt: int = 1) -> Dict:
         bm25_index=bm25_index,
         chunks=chunks,
         model=model,
-        final_top_k=MDCG_FINAL_TOP_K,
+        final_top_k=CATALOG_MDCG_FINAL_TOP_K,
+    )
+
+    direct_mdcg_pool = retrieve_track(
+        query=query,
+        source_type="MDCG",
+        document_ids=all_mdcg_doc_ids,
+        faiss_index=faiss_index,
+        bm25_index=bm25_index,
+        chunks=chunks,
+        model=model,
+        final_top_k=DIRECT_MDCG_POOL_TOP_K,
+    )
+    direct_mdcg_chunks = slice_attempt_results(
+        results=direct_mdcg_pool,
+        attempt=attempt,
+        per_attempt=DIRECT_MDCG_CHUNKS_PER_ATTEMPT,
+    )
+
+    mdcg_chunks = deduplicate_chunks(
+        catalog_mdcg_chunks + direct_mdcg_chunks,
+        limit=MDCG_FINAL_TOP_K,
     )
 
     return {
         "attempt": attempt,
         "selected_mdr_documents": selected["mdr_docs"],
         "selected_mdcg_documents": selected["mdcg_docs"],
+        "direct_mdcg_chunks": direct_mdcg_chunks,
         "mdr_chunks": mdr_chunks,
         "mdcg_chunks": mdcg_chunks,
     }
