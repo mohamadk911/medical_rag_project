@@ -8,6 +8,7 @@ data/processed/
 output/
 indexes/
 models/
+tools/ngrok
 *.faiss
 *.pkl
 *.sqlite

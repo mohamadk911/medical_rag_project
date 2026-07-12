@@ -27,7 +27,7 @@ from pathlib import Path
 import json
 import pickle
 import re
-from typing import List, Dict, Tuple
+from typing import Any, List, Dict, Tuple
 
 import faiss
 import numpy as np
@@ -35,6 +35,7 @@ from rank_bm25 import BM25Okapi
 from fastembed import TextEmbedding
 
 from catalog_retrieve import catalog_retrieve
+from observability.langfuse_tracing import chunks_trace_metadata
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -324,28 +325,109 @@ def retrieve_track(
     chunks: List[Dict],
     model: TextEmbedding,
     final_top_k: int,
+    tracer: Any = None,
+    track_name: str | None = None,
 ) -> List[Dict]:
     if not document_ids:
         return []
 
-    bm25_results = bm25_search_filtered(
-        query=query,
-        bm25_index=bm25_index,
-        chunks=chunks,
-        source_type=source_type,
-        document_ids=document_ids,
-        top_k=BM25_TOP_K,
+    span_context = (
+        tracer.span(
+            "chunk_retrieval",
+            input={
+                "query": query,
+                "source_type": source_type,
+                "document_ids": sorted(document_ids),
+                "bm25_top_k": BM25_TOP_K,
+                "dense_top_k": DENSE_TOP_K,
+            },
+            metadata={"track": track_name or source_type},
+        )
+        if tracer
+        else None
     )
 
-    dense_results = dense_search_filtered(
-        query=query,
-        faiss_index=faiss_index,
-        chunks=chunks,
-        model=model,
-        source_type=source_type,
-        document_ids=document_ids,
-        top_k=DENSE_TOP_K,
+    if span_context:
+        with span_context as span:
+            bm25_results = bm25_search_filtered(
+                query=query,
+                bm25_index=bm25_index,
+                chunks=chunks,
+                source_type=source_type,
+                document_ids=document_ids,
+                top_k=BM25_TOP_K,
+            )
+
+            dense_results = dense_search_filtered(
+                query=query,
+                faiss_index=faiss_index,
+                chunks=chunks,
+                model=model,
+                source_type=source_type,
+                document_ids=document_ids,
+                top_k=DENSE_TOP_K,
+            )
+            span.end(output={
+                "bm25_result_count": len(bm25_results),
+                "dense_result_count": len(dense_results),
+                "bm25_chunks": chunks_trace_metadata(bm25_results),
+                "dense_chunks": chunks_trace_metadata(dense_results),
+            })
+    else:
+        bm25_results = bm25_search_filtered(
+            query=query,
+            bm25_index=bm25_index,
+            chunks=chunks,
+            source_type=source_type,
+            document_ids=document_ids,
+            top_k=BM25_TOP_K,
+        )
+
+        dense_results = dense_search_filtered(
+            query=query,
+            faiss_index=faiss_index,
+            chunks=chunks,
+            model=model,
+            source_type=source_type,
+            document_ids=document_ids,
+            top_k=DENSE_TOP_K,
+        )
+
+    merge_context = (
+        tracer.span(
+            "hybrid_retrieval_merge",
+            input={
+                "source_type": source_type,
+                "bm25_result_count": len(bm25_results),
+                "dense_result_count": len(dense_results),
+                "final_top_k": final_top_k,
+            },
+            metadata={"track": track_name or source_type},
+        )
+        if tracer
+        else None
     )
+
+    if merge_context:
+        with merge_context as span:
+            merged_results = merge_results(
+                bm25_results=bm25_results,
+                dense_results=dense_results,
+                final_top_k=final_top_k,
+            )
+            selected_chunk_ids = {
+                chunk.get("chunk_id")
+                for chunk in merged_results
+                if chunk.get("chunk_id")
+            }
+            span.end(output={
+                "merged_result_count": len(merged_results),
+                "chunks": chunks_trace_metadata(
+                    merged_results,
+                    selected_chunk_ids=selected_chunk_ids,
+                ),
+            })
+            return merged_results
 
     return merge_results(
         bm25_results=bm25_results,
@@ -394,8 +476,25 @@ def slice_attempt_results(
     return results[start:end]
 
 
-def retrieve(query: str, attempt: int = 1) -> Dict:
-    selected = select_documents(query, attempt=attempt)
+def retrieve(query: str, attempt: int = 1, tracer: Any = None) -> Dict:
+    if tracer:
+        with tracer.span(
+            "document_catalog_retrieval",
+            input={
+                "query": query,
+                "attempt": attempt,
+                "catalog_top_k": CATALOG_TOP_K,
+                "mdcg_docs_per_attempt": MDCG_DOCS_PER_ATTEMPT,
+            },
+        ) as span:
+            selected = select_documents(query, attempt=attempt)
+            span.end(output={
+                "selected_mdr_documents": selected["mdr_docs"],
+                "selected_mdcg_documents": selected["mdcg_docs"],
+                "catalog_result_count": len(selected.get("catalog_results", [])),
+            })
+    else:
+        selected = select_documents(query, attempt=attempt)
 
     mdr_doc_ids = {
         doc["document_id"]
@@ -424,6 +523,8 @@ def retrieve(query: str, attempt: int = 1) -> Dict:
         chunks=chunks,
         model=model,
         final_top_k=MDR_FINAL_TOP_K,
+        tracer=tracer,
+        track_name="mdr",
     )
 
     catalog_mdcg_chunks = retrieve_track(
@@ -435,6 +536,8 @@ def retrieve(query: str, attempt: int = 1) -> Dict:
         chunks=chunks,
         model=model,
         final_top_k=CATALOG_MDCG_FINAL_TOP_K,
+        tracer=tracer,
+        track_name="mdcg_catalog_selected_documents",
     )
 
     direct_mdcg_pool = retrieve_track(
@@ -446,6 +549,8 @@ def retrieve(query: str, attempt: int = 1) -> Dict:
         chunks=chunks,
         model=model,
         final_top_k=DIRECT_MDCG_POOL_TOP_K,
+        tracer=tracer,
+        track_name="mdcg_direct_all_documents",
     )
     direct_mdcg_chunks = slice_attempt_results(
         results=direct_mdcg_pool,

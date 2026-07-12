@@ -66,7 +66,10 @@ def generate_source_fallback_answer(question: str, chunks: List[Dict]) -> str:
     ]
 
     sections = [
-        "Gemini quota is exhausted, so I cannot generate the polished final answer right now.",
+        (
+            "Gemini returned a rate-limit or quota error, so I cannot generate "
+            "the polished final answer right now."
+        ),
         "Retrieval did succeed. Here are the strongest retrieved sources for your question:",
         f"Question: {question}",
     ]
@@ -78,7 +81,10 @@ def generate_source_fallback_answer(question: str, chunks: List[Dict]) -> str:
         sections.append("MDR legal-basis evidence:\n" + "\n\n".join(mdr_blocks))
 
     sections.append(
-        "When quota is available again, rerun the same question to get the full generated answer."
+        (
+            "Try again after a short wait, or reduce top_k/context size if this "
+            "happens repeatedly."
+        )
     )
 
     return "\n\n".join(sections)

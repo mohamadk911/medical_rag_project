@@ -3,8 +3,10 @@ fastembed
 faiss-cpu
 rank-bm25
 google-genai
+langfuse
 python-dotenv
 numpy
 tqdm
 requests
 beautifulsoup4
+streamlit
