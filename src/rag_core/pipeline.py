@@ -18,6 +18,10 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from evidence_gate import check_evidence_gate
+from external_access_check import (
+    ExternalAccessMonitor,
+    external_access_check_enabled,
+)
 from fallback_answer import generate_source_fallback_answer
 from generate_answer import GEMINI_MODEL as ANSWER_MODEL
 from generate_answer import generate_answer
@@ -278,9 +282,12 @@ def _failure_result(
     metadata: dict,
     start_time: float,
     tracer: Any = None,
+    external_monitor: ExternalAccessMonitor | None = None,
 ) -> dict:
     runtime_seconds = round(time.perf_counter() - start_time, 3)
     metadata["runtime_seconds"] = runtime_seconds
+    if external_monitor:
+        metadata["external_access_check"] = external_monitor.summary()
 
     if tracer:
         with tracer.span(
@@ -297,6 +304,9 @@ def _failure_result(
                 "citations": sources,
                 "grounding_status": metadata.get("grounding_status"),
             })
+
+        if external_monitor:
+            external_monitor.trace_summary()
 
         _finalize_langfuse_trace(
             tracer=tracer,
@@ -324,6 +334,29 @@ def _failure_result(
 
 
 def answer_question(question: str, settings: dict | None = None) -> dict:
+    monitor = ExternalAccessMonitor(
+        enabled=external_access_check_enabled(settings),
+        question=question,
+    )
+
+    with monitor:
+        result = _answer_question_impl(
+            question,
+            settings=settings,
+            external_monitor=monitor,
+        )
+
+    if isinstance(result, dict):
+        result.setdefault("metadata", {})["external_access_check"] = monitor.summary()
+
+    return result
+
+
+def _answer_question_impl(
+    question: str,
+    settings: dict | None = None,
+    external_monitor: ExternalAccessMonitor | None = None,
+) -> dict:
     """
     Returns:
     {
@@ -358,6 +391,8 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
         settings=trace_settings,
         selected_documents=metadata["selected_documents"],
     )
+    if external_monitor:
+        external_monitor.tracer = tracer
 
     question = validate_question(question)
     domain_gate_result = _domain_gate(question)
@@ -372,6 +407,7 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
             metadata=metadata,
             start_time=start_time,
             tracer=tracer,
+            external_monitor=external_monitor,
         )
 
     last_sources: list = []
@@ -494,6 +530,7 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
                     metadata=metadata,
                     start_time=start_time,
                     tracer=tracer,
+                    external_monitor=external_monitor,
                 )
         else:
             metadata["answerability_status"] = {
@@ -543,6 +580,7 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
                     metadata=metadata,
                     start_time=start_time,
                     tracer=tracer,
+                    external_monitor=external_monitor,
                 )
 
         if not validate_answer_text(answer):
@@ -554,6 +592,7 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
                 metadata=metadata,
                 start_time=start_time,
                 tracer=tracer,
+                external_monitor=external_monitor,
             )
 
         with tracer.span(
@@ -596,6 +635,7 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
                 metadata=metadata,
                 start_time=start_time,
                 tracer=tracer,
+                external_monitor=external_monitor,
             )
 
         metadata["generation_status"] = "generated"
@@ -607,6 +647,7 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
             metadata=metadata,
             start_time=start_time,
             tracer=tracer,
+            external_monitor=external_monitor,
         )
 
     return _failure_result(
@@ -617,4 +658,5 @@ def answer_question(question: str, settings: dict | None = None) -> dict:
         metadata=metadata,
         start_time=start_time,
         tracer=tracer,
+        external_monitor=external_monitor,
     )
