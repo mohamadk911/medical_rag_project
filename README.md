@@ -1,177 +1,130 @@
-# MDR / MDCG Regulatory RAG
+# MDR / MDCG Regulatory RAG Assistant
 
-This project is a thesis prototype for answering regulatory questions using the
-EU Medical Device Regulation (MDR 2017/745) and downloaded Medical Device
-Coordination Group (MDCG) guidance documents. The system is implemented as a
-local retrieval-augmented generation (RAG) pipeline with a Streamlit interface
-for testing and demonstration.
+Thesis prototype for evidence-grounded question answering over the EU Medical Device Regulation (MDR 2017/745) and Medical Device Coordination Group (MDCG) guidance.
 
-The prototype is intended to support regulatory analysis by retrieving relevant
-MDR and MDCG evidence, generating an answer with Gemini, and exposing the
-retrieved sources so the answer can be checked against the underlying documents.
-It is not a replacement for official legal or regulatory review.
+The system retrieves local regulatory evidence, generates an answer with Gemini, and exposes the supporting chunks and source metadata for human verification. It is an educational research prototype—not legal advice or a certified regulatory decision system.
 
-## Main Features
+## At a glance
 
-- PDF text extraction from MDR and MDCG source documents using PyMuPDF.
-- Legal-structure chunking for the MDR, based primarily on Articles and Annexes.
-- Full-document or overlapping large-text chunking for MDCG guidance documents.
-- Document-level catalog retrieval followed by chunk-level evidence retrieval.
-- Hybrid retrieval using BM25 keyword search and dense FAISS vector search.
-- Dense embeddings generated with `BAAI/bge-small-en-v1.5` through FastEmbed.
-- Gemini-based answer generation from retrieved evidence.
-- Optional LLM reranking from the Streamlit sidebar.
-- Langfuse tracing for observability and evaluation metadata.
-- Runtime external-access monitoring to verify whether live web search or
-  unexpected external APIs were used during a run.
+| | |
+|---|---|
+| **Problem** | Regulatory answers must be traceable to the MDR and relevant MDCG guidance |
+| **Approach** | Two-stage, hybrid retrieval followed by evidence-constrained generation |
+| **Stack** | Python, FAISS, BM25, FastEmbed, Gemini, Streamlit, Langfuse |
+| **Retrieval** | 60% lexical BM25 + 40% dense similarity at document and chunk level |
+| **Guardrails** | Source validation, bounded retries, optional evidence and grounding checks |
 
-## Architecture Overview
+## Architecture
 
-The implemented workflow has three main phases:
+```mermaid
+flowchart LR
+    subgraph Preparation
+        A[MDR and MDCG PDFs] --> B[PDF extraction]
+        B --> C[Legal-aware chunking]
+        A --> D[Document catalog]
+        C --> E[Chunk indexes: BM25 + FAISS]
+        D --> F[Catalog indexes: BM25 + FAISS]
+    end
 
-1. **Knowledge preparation**
-   - `src/chunk_documents.py` extracts text from the MDR PDF and local MDCG PDFs.
-   - MDR content is split using detected `Article` and `ANNEX` headings.
-   - MDCG documents are kept as one chunk when small enough, or split into large
-     overlapping chunks when necessary.
-   - `src/catalog_builder.py` creates a document-level catalog containing the MDR
-     and one entry per MDCG document.
+    subgraph Retrieval
+        Q[User question] --> F
+        F --> S[Relevant document selection]
+        S --> E
+        E --> H[MDR and MDCG evidence tracks]
+        H --> RR[Optional LLM reranking]
+    end
 
-2. **Indexing**
-   - `src/build_index.py` builds two index levels:
-     - a document-level catalog index;
-     - a chunk-level evidence index.
-   - Each level stores:
-     - a BM25 index;
-     - a FAISS dense-vector index;
-     - associated metadata.
-   - Both retrieval levels use the same hybrid weighting:
-     `0.6 BM25 + 0.4 dense retrieval`.
+    subgraph Answering
+        RR --> G[Gemini answer generation]
+        G --> V[Optional grounding check]
+        V --> UI[Streamlit answer, sources, evidence, metadata]
+        G --> O[Langfuse traces and usage logs]
+    end
+```
 
-3. **Question answering**
-   - `src/rag_core/pipeline.py` validates the question and calls the retrieval
-     pipeline.
-   - `src/retrieve.py` performs catalog-guided retrieval and chunk-level evidence
-     retrieval.
-   - Retrieved chunks are optionally reranked.
-   - Gemini generates the final answer using only the selected evidence context.
-   - The Streamlit UI displays the answer, sources, retrieved chunks, and metadata.
+## Why this design
 
-## Retrieval Method
+### Two-stage retrieval
 
-The retrieval implementation is two-level and hybrid.
+The first stage identifies relevant regulatory documents before searching inside their content. This reduces noise when the MDCG collection is large and preserves a separate MDR evidence track as the binding legal basis.
 
-First, the system searches the document catalog to identify relevant MDR and MDCG
-documents. The catalog itself is indexed with BM25 and FAISS dense retrieval.
+### Hybrid search
 
-Second, the system searches the chunk-level evidence index. MDR chunks and MDCG
-chunks are retrieved as separate evidence tracks. BM25 supports exact regulatory
-terminology matching, while dense retrieval supports semantic similarity.
+BM25 captures exact legal phrases, article numbers, and guidance references. Dense retrieval captures semantically related language. Both score sets are normalized and combined with a 0.6 / 0.4 weighting.
 
-For MDCG evidence, catalog-guided chunk retrieval is supplemented by direct
-hybrid retrieval across all MDCG chunks, and both result sets are merged before
-reranking and final context selection.
+### Bounded recovery
 
-The pipeline allows up to three retrieval attempts. If optional evidence-gate or
-grounding checks reject the evidence or generated answer, the next attempt uses a
-different batch of catalog-selected MDCG documents and a different slice of
-directly retrieved MDCG chunks. This retry mechanism prevents an infinite loop
-while giving the system additional chances to find sufficient evidence.
+The pipeline allows at most three retrieval attempts. A later attempt uses a different catalog slice and a different pool of directly retrieved MDCG chunks, improving recall without creating an uncontrolled loop.
 
-## Streamlit Workflow
+### Traceability and observability
 
-The standard Streamlit workflow is designed for stable professor/testing use.
-It enables:
+The UI returns source labels, document metadata, chunk IDs, page ranges, retrieval scores, and evidence text. Optional Langfuse tracing records retrieval, reranking, answer generation, source-support metadata, and external-access summaries.
 
-- question input;
-- top-k control;
-- optional reranking;
-- answer generation;
-- source and evidence display;
-- metadata display.
+## Engineering highlights
 
-The evidence-gate and grounding-verification modules are implemented in the
-backend pipeline as optional validation components, but they are disabled in the
-standard Streamlit workflow to reduce latency and avoid additional LLM quota
-dependency.
+- Built legal-structure chunking for MDR Articles and Annexes.
+- Implemented document-level and chunk-level BM25 / FAISS indexes.
+- Kept MDR and MDCG evidence as separate retrieval tracks before final context selection.
+- Added optional LLM reranking, evidence-sufficiency checks, and grounding checks.
+- Added controlled source-based fallback behavior for Gemini quota failures.
+- Added runtime monitoring for unexpected external access.
+- Protected the Streamlit demonstration with a constant-time password comparison.
+- Centralized prompts in version-controlled text files for review and iteration.
 
-## Observability and Logging
-
-The project records runtime information for evaluation:
-
-- `logs/usage.log` stores request and response metadata.
-- `logs/external_access_check.log` stores whether live web search or unexpected
-  external API calls were detected.
-- Langfuse tracing records retrieval, reranking, answer generation, source
-  support metadata, and external-access summaries when Langfuse credentials are
-  configured.
-
-Expected external services are Gemini for answer generation and Langfuse for
-observability. The RAG retrieval itself uses local indexes and does not require
-live web search.
-
-## Project Structure
+## Project map
 
 ```text
 src/
-  build_index.py              Build BM25 and FAISS indexes
-  catalog_builder.py          Build document-level catalog
-  catalog_retrieve.py         Stage 1 catalog retrieval
-  chunk_documents.py          Extract and chunk MDR/MDCG PDFs
-  retrieve.py                 Stage 2 hybrid evidence retrieval
-  generate_answer.py          Gemini answer generation
-  llm_rerank.py               Optional Gemini reranking
-  evidence_gate.py            Optional evidence sufficiency check
-  grounding_check.py          Optional grounding verification
-  external_access_check.py    Runtime external-access monitor
-  rag_core/pipeline.py        Streamlit-callable RAG pipeline
-  ui/streamlit_app.py         Browser UI
+├── chunk_documents.py           # Extract and chunk MDR / MDCG PDFs
+├── catalog_builder.py           # Build the document-level catalog
+├── build_index.py               # Build BM25 and FAISS indexes
+├── catalog_retrieve.py          # Stage 1: document retrieval
+├── retrieve.py                  # Stage 2: evidence retrieval
+├── llm_rerank.py                # Optional Gemini reranking
+├── generate_answer.py           # Evidence-constrained answer generation
+├── evidence_gate.py             # Optional evidence sufficiency check
+├── grounding_check.py           # Optional grounding verification
+├── external_access_check.py     # Runtime external-access monitor
+├── rag_core/pipeline.py         # Application-facing orchestration
+└── ui/streamlit_app.py          # Streamlit interface
 
-prompts/                       Prompt templates
-data/raw/                      Source PDFs
-data/processed/                Processed catalog and chunk JSON files
-indexes/                       Local BM25, FAISS, and metadata indexes
-logs/                          Runtime logs
-tests/                         Unit tests
+prompts/                          # Version-controlled prompt templates
+tests/                            # Dependency-light guardrail tests
 ```
 
-## Setup
+Regulatory PDFs, processed data, model caches, and generated indexes are intentionally excluded from Git because of size and source-distribution considerations.
 
-Create and activate a Python environment:
+## Quick start
+
+### 1. Create the environment
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-Create a `.env` file with the required credentials:
+Add your Gemini key and choose a Streamlit password in `.env`. Langfuse credentials are optional.
+
+### 2. Prepare the regulatory sources
+
+Place the MDR PDF at:
+
+```text
+data/raw/MDR.pdf
+```
+
+Download the current MDCG files and catalog metadata:
 
 ```bash
-GEMINI_API_KEY=your_gemini_key_here
-STREAMLIT_APP_PASSWORD=choose_a_password_here
-
-# Optional Langfuse tracing
-LANGFUSE_PUBLIC_KEY=your_langfuse_public_key
-LANGFUSE_SECRET_KEY=your_langfuse_secret_key
-LANGFUSE_HOST=https://cloud.langfuse.com
-LANGFUSE_BASE_URL=https://cloud.langfuse.com
-
-# Optional, enabled by default if omitted
-EXTERNAL_ACCESS_CHECK_ENABLED=true
+python src/download_mdcg.py
+python src/download_mdcg_catalog.py
 ```
 
-Do not commit real API keys or passwords.
+These downloaders depend on the current European Commission page structure and may require maintenance if that site changes.
 
-## Building Data and Indexes
-
-If processed data and indexes already exist, this step can be skipped. To rebuild
-from local source PDFs:
+### 3. Build the corpus and indexes
 
 ```bash
 python src/chunk_documents.py
@@ -179,64 +132,30 @@ python src/catalog_builder.py
 python src/build_index.py
 ```
 
-If MDCG source documents need to be downloaded again, use:
+Only build or load indexes that you created or trust: the BM25 index files use Python pickle serialization.
 
-```bash
-python src/download_mdcg.py
-python src/download_mdcg_catalog.py
-```
-
-The indexing step creates the catalog-level and chunk-level BM25/FAISS indexes
-used by the retrieval pipeline.
-
-## Running the Streamlit Demo
+### 4. Start the interface
 
 ```bash
 streamlit run src/ui/streamlit_app.py --server.port 8501
 ```
 
-Then open:
-
-```text
-http://localhost:8501
-```
-
-The UI requires the password configured in `STREAMLIT_APP_PASSWORD`.
-
-## Sharing With ngrok
-
-Keep Streamlit running locally:
-
-```bash
-streamlit run src/ui/streamlit_app.py --server.port 8501
-```
-
-In another terminal:
-
-```bash
-ngrok http 8501
-```
-
-Share the public `https://...ngrok-free.app` URL and the
-`STREAMLIT_APP_PASSWORD` with the tester. Anyone with both can use the running
-application and the configured Gemini quota while the tunnel remains active.
+Open `http://localhost:8501` and enter the password configured in `.env`.
 
 ## Tests
 
-Install `pytest` if it is not already available, then run the available unit
-tests with:
+The included tests use Python's standard library and do not require `pytest`:
 
 ```bash
-pip install pytest
-python -m pytest
+python -m unittest discover -s tests -v
 ```
 
-## Current Limitations
+Current result: **6 tests passing** for source validation and prompt-integrity checks.
 
-- The system is a thesis prototype, not a certified regulatory decision system.
-- MDCG chunk page ranges are stored at document level rather than as exact
-  per-chunk page ranges.
-- Some optional validation modules require additional Gemini calls and are
-  disabled in the default Streamlit workflow.
-- Generated answers should always be checked against the displayed MDR and MDCG
-  sources.
+## Current limitations
+
+- The repository does not include the regulatory PDF corpus or generated indexes.
+- MDCG page ranges are currently stored at document level rather than exact per-chunk ranges.
+- The separate topical domain gate is not yet implemented; the current guardrail rejects empty questions and validates retrieved evidence structure.
+- Optional validation stages add Gemini calls, latency, and quota usage, so they are disabled in the default Streamlit workflow.
+- Generated answers must always be checked against the displayed official sources.
